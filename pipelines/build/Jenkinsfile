@@ -1,4 +1,4 @@
-git_creds = 'toptal-gitlab-creds'
+git_creds = 'gitlab-creds'
 ImageRegistry = 'docker.io'
 ImageRepository = 'manjumaikan'
 apiBuilderImageName = '3tier-api'
@@ -30,7 +30,7 @@ pipeline {
     stages {
     stage('Checkout') {
       steps {
-        checkoutSCM('https://git.toptal.com/screening/manju-maikan-krishnappa', 'master', "${git_creds}", '3tier-app', 'false')
+        checkoutSCM('https://github.com/manjumaikan/3tier-app.git', 'master', "${git_creds}", '3tier-app', 'false')
         script {
                 sh ("""
                 ls

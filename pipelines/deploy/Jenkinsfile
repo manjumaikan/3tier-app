@@ -1,6 +1,6 @@
 #!/usr/bin/env groovy
 
-git_creds = 'toptal-gitlab-creds'
+git_creds = 'gitlab-creds'
 ImageRegistry = 'docker.io'
 ImageRepository = 'manjumaikan'
 apiBuilderImageName = '3tier-api'
@@ -82,7 +82,7 @@ pipeline {
  
         stage('Checkout infra') {
                 steps {
-                  checkoutSCM('https://git.toptal.com/screening/manju-maikan-krishnappa', 'master', "${git_creds}", '3tier-infra', 'false')
+                  checkoutSCM('https://github.com/manjumaikan/3tier-app.git', 'master', "${git_creds}", '3tier-infra', 'false')
                   script {
                     currentBuild.displayName = "3tier-deploy:${ENVIRONMENT}:${BUILD_TO_DEPLOY}-weight:${Weight}"
                     currentBuild.description = "Deploying components of 3 tier app"

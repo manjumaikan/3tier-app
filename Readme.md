@@ -1,6 +1,6 @@
 1. Architecture Diagram:
    
-- ![alt text](images/AWS-3tier-toptal.jpeg "Architecture")
+- ![alt text](images/AWS-3tier.jpeg "Architecture")
 
 2. Build
 
