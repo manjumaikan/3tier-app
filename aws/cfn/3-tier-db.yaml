@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: An AWS RDS Postgres database for the 3 tier application
+#TODO: "AutoMinorVersionUpgrade" has to be disabled for PROD, but enabled for all the rest
+Parameters:
+  envCode:
+    Description: Which environment   ?
+    Type: String
+    Default: NonProduction
+    AllowedValues:
+    - NonProduction
+    - End2End
+    - ProductionSupport
+    - Production
+  envSubCode:
+    Description: Which logical environment ?
+    Type: String
+    Default: dev
+    AllowedValues:
+    - dev
+    - st
+    - psvt
+    - rsvt
+    - psup
+    - prod
+  DBUser:
+    Description: The Master username for the DB
+    Type: String
+    Default: masteruser
+  DBNAME:
+    Description: Database Name. Do not make it longer than 8 characters
+    Type: String
+    Default: aws3tierdb
+  DBPassword:
+    Description: The Master password for the DB
+    Type: String
+    Default: Secret
+  DBSnapshotARN:
+    Description: If you wish to restore the database from snapshot then put the snapshot
+      ARN in here
+    Type: String
+    Default: N/A
+  DBSnapshotSize:
+    Description: If specifying a snapshot, please provide EXACTLY THE SAME SIZE in GB as per the snapshot. Larger size (needs to be at least 10% larger) can be provided, but not recommended (takes much longer to provision).
+    Type: String
+    Default: 100
+Conditions:
+  isDbNotSnapshot: !Equals [!Ref 'DBSnapshotARN', N/A]
+  isDbSnapshot: !Not [!Equals [!Ref 'DBSnapshotARN', N/A]]
+Mappings:
+  ENVIRONS:
+    NonProduction:
+      ABRV: np
+    Production:
+      ABRV: pr
+    End2End:
+      ABRV: ee
+    ProductionSupport:
+      ABRV: ps
+  ServerSize:
+    db:
+      NonProduction: db.t3.medium
+      End2End: db.t3.medium
+      ProductionSupport: db.t3.medium
+      Production: db.r3.large
+  ServerSnapshotRetension:
+    db:
+      NonProduction: '15'
+      End2End: '15'
+      ProductionSupport: '30'
+      Production: '30'
+  dbParameters:
+    Production:
+      AllocatedStorage: '100'
+      AllowMajorVersionUpgrade: 'false'
+      AutoMinorVersionUpgrade: 'false'
+      BackupRetentionPeriod: '31'
+      Iops: '0'
+      PreferredBackupWindow: 17:00-17:59
+      PreferredMaintenanceWindow: Sun:18:00-Sun:18:30
+      StorageType: 'gp2'
+      MultiAZ: 'true'
+    ProductionSupport:
+      AllocatedStorage: '100'
+      AllowMajorVersionUpgrade: 'true'
+      AutoMinorVersionUpgrade: 'true'
+      BackupRetentionPeriod: '15'
+      Iops: '0'
+      PreferredBackupWindow: 17:00-17:59
+      PreferredMaintenanceWindow: Sun:18:00-Sun:18:30
+      StorageType: 'gp2'
+      MultiAZ: 'false'
+    End2End:
+      AllocatedStorage: '100'
+      AllowMajorVersionUpgrade: 'true'
+      AutoMinorVersionUpgrade: 'true'
+      BackupRetentionPeriod: '15'
+      Iops: '0'
+      PreferredBackupWindow: 17:00-17:59
+      PreferredMaintenanceWindow: Sun:18:00-Sun:18:30
+      StorageType: 'gp2'
+      MultiAZ: 'false'
+    NonProduction:
+      AllocatedStorage: '100'
+      AllowMajorVersionUpgrade: 'true'
+      AutoMinorVersionUpgrade: 'true'
+      BackupRetentionPeriod: '15'
+      Iops: '0'
+      PreferredBackupWindow: 17:00-17:59
+      PreferredMaintenanceWindow: Sun:18:00-Sun:18:30
+      StorageType: 'gp2'
+      MultiAZ: 'false'
+Resources:
+  sgpRDBMS:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: This security group is for 3 Tier Application
+      GroupName: !Sub aws-3tier-db-sg-${envSubCode} 
+      VpcId: !ImportValue 'vpc:vpc1'
+      Tags:
+      - Key: Name
+        Value: SeGr_PG_AWS_RDBMS
+      - Key: info:taggingVersion
+        Value: 2
+  rdsRdbmsDb1PGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: Parameter Group
+      Family: postgres12
+      Parameters:
+        max_prepared_transactions: '100'
+        rds.force_ssl: '1'
+      Tags:
+      - Key: Name
+        Value: PaGr_PG_AWS_RDBMS
+      - Key: ROLE
+        Value: AWS_RDBMS_PGroup
+      - Key: Description
+        Value: Database Parameter Group for the DB.
+      - Key: FUNCTION
+        Value: DBParamterGroup
+      - Key: info:taggingVersion
+        Value: 2
+
+  rdsRDBMSDb1:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Condition: isDbNotSnapshot
+    Properties:
+      AllocatedStorage: !FindInMap [dbParameters, !Ref 'envCode', AllocatedStorage]
+      AllowMajorVersionUpgrade: !FindInMap [dbParameters, !Ref 'envCode', AllowMajorVersionUpgrade]
+      AutoMinorVersionUpgrade: !FindInMap [dbParameters, !Ref 'envCode', AutoMinorVersionUpgrade]
+      BackupRetentionPeriod: !FindInMap [dbParameters, !Ref 'envCode', BackupRetentionPeriod]
+      CopyTagsToSnapshot: 'True'
+      DBInstanceClass: !FindInMap [ServerSize, db, !Ref 'envCode']
+      DBName: !Ref 'DBNAME'
+      DBInstanceIdentifier: !Join ['', ['aws-3tier-', !Ref 'envSubCode']]
+      DBSubnetGroupName: !ImportValue 'dbsubnetgroup:vpc1:all'
+      Engine: postgres
+      MasterUsername: !Ref 'DBUser'
+      MasterUserPassword: !Ref 'DBPassword'
+      MultiAZ: !FindInMap [dbParameters, !Ref 'envCode', MultiAZ]
+      Port: '5432'
+      DBParameterGroupName: !Ref 'rdsRdbmsDb1PGroup'
+      PreferredBackupWindow: !FindInMap [dbParameters, !Ref 'envCode', PreferredBackupWindow]
+      PreferredMaintenanceWindow: !FindInMap [dbParameters, !Ref 'envCode', PreferredMaintenanceWindow]
+      PubliclyAccessible: 'false'
+      StorageEncrypted: 'true'
+      StorageType: gp2
+      Tags:
+      - Key: Name
+        Value: !Join ['', ['aws-3tier-', !Ref 'envSubCode']]
+      - Key: ROLE
+        Value: AWS_RDBMS
+      - Key: Description
+        Value: Database for the 3 tier App.
+      - Key: FUNCTION
+        Value: DB
+      - Key: info:taggingVersion
+        Value: 2
+      VPCSecurityGroups:
+      - !Ref 'sgpRDBMS'
+
+  rdsRDBMSDb1FromSnapshot:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    Condition: isDbSnapshot
+    Properties:
+      AllocatedStorage: !Ref 'DBSnapshotSize'
+      AllowMajorVersionUpgrade: !FindInMap [dbParameters, !Ref 'envCode', AllowMajorVersionUpgrade]
+      AutoMinorVersionUpgrade: !FindInMap [dbParameters, !Ref 'envCode', AutoMinorVersionUpgrade]
+      CopyTagsToSnapshot: 'True'
+      BackupRetentionPeriod: !FindInMap [dbParameters, !Ref 'envCode', BackupRetentionPeriod]
+      DBInstanceClass: !FindInMap [ServerSize, db, !Ref 'envCode']
+      DBInstanceIdentifier: !Join ['', ['3tier-', !Ref 'envSubCode']]
+      DBSubnetGroupName: !ImportValue 'dbsubnetgroup:vpc1:all'
+      DBSnapshotIdentifier: !Ref 'DBSnapshotARN'
+      Engine: postgres
+      Iops: !FindInMap [dbParameters, !Ref 'envCode',Iops]
+      MultiAZ: !FindInMap [dbParameters, !Ref 'envCode', MultiAZ]
+      Port: '5432'
+      DBParameterGroupName: !Ref 'rdsRdbmsDb1PGroup'
+      PreferredBackupWindow: !FindInMap [dbParameters, !Ref 'envCode', PreferredBackupWindow]
+      PreferredMaintenanceWindow: !FindInMap [dbParameters, !Ref 'envCode', PreferredMaintenanceWindow]
+      PubliclyAccessible: 'false'
+      StorageEncrypted: 'true'
+      StorageType: !FindInMap [dbParameters, !Ref 'envCode', StorageType]
+      Tags:
+      - Key: Name
+        Value: !Join ['', ['aws-3tier-', !Ref 'envSubCode']]
+      - Key: ROLE
+        Value: AWS_RDBMS
+      - Key: Description
+        Value: Database for the DB.
+      - Key: FUNCTION
+        Value: DB
+      - Key: info:taggingVersion
+        Value: 2
+      VPCSecurityGroups:
+      - !Ref 'sgpRDBMS'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: Base build details
+      Parameters:
+      - DBSnapshotARN
+    - Label:
+        default: DB Details
+      Parameters:
+      - DBUser
+      - DBPassword
+    - Label:
+        default: Environment Details
+      Parameters:
+      - envCode
+      - envSubCode
+    ParameterLabels:
+      DBUser:
+        default: DB Username
+      DBPassword:
+        default: DB Password
+      DBSnapshotARN:
+        default: DB Snapshot ARN
+      envCode:
+        default: Physical Environment
+      envSubCode:
+        default: Logical Environment
+Outputs:
+  DatabaseName:
+    Description: DB Name. For the databases restored from the snapshot the DBNAME will stay the same.
+    Value: !Ref 'DBNAME'
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseName'    
+  DatabaseEndpointPort:
+    Description: DB Endpoint TCP Port
+    Value: !If [isDbNotSnapshot, !GetAtt [rdsRDBMSDb1, Endpoint.Port], !GetAtt [rdsRDBMSDb1FromSnapshot,Endpoint.Port]]
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseEndpointPort'    
+  DatabaseUsername:
+    Description: DB Username. For the databases restored from the snapshot the user name will stay the same.
+    Value: !Ref 'DBUser'
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseUsername'    
+  DatabasePassword:
+    Description: DB Password. For the databases restored from the snapshot the password will stay the same.
+    Value: !Ref 'DBPassword'
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabasePassword'    
+  DatabaseHostname:
+    Description: DB Instance Hostname
+    Value: !GetAtt rdsRDBMSDb1.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-DatabaseHostname'    

@@ -1,0 +1,191 @@
+git_creds = 'toptal-gitlab-creds'
+ImageRegistry = 'docker.io'
+ImageRepository = 'manjumaikan'
+apiBuilderImageName = '3tier-api'
+webBuilderImageName = '3tier-web'
+
+pipeline {
+    agent {
+        kubernetes {
+            workingDir '/tmp/jenkins'
+            yaml """
+              kind: Pod
+              metadata:
+                namespace: jenkins
+                labels:
+                  jenkins: slave
+              spec:
+                containers:
+                - name: jnlp
+                  image: jenkins/jnlp-slave
+                - name: kaniko
+                  image: gcr.io/kaniko-project/executor:debug
+                  imagePullPolicy: Always
+                  command:
+                    - /busybox/cat
+                  tty: true
+                """
+              }
+          }
+    stages {
+    stage('Checkout') {
+      steps {
+        checkoutSCM('https://git.toptal.com/screening/manju-maikan-krishnappa', 'master', "${git_creds}", '3tier-app', 'false')
+        script {
+                sh ("""
+                ls
+                """)
+          currentBuild.displayName = "3tier:${BUILD_ID}"
+          currentBuild.description = "Building components of 3 tier app"
+        }
+      }
+    }
+    
+    stage('Docker build api') {
+                steps{
+                    container(name: 'kaniko', shell: '/busybox/sh'){
+                        dir("${workspace}/3tier-app") {
+            withCredentials([file(credentialsId: 'DockerCredentialConfig', variable: 'dockerConfig')]) {
+            sh ('''#!/busybox/sh
+                cp $dockerConfig /kaniko/.docker/config.json
+            ''')
+          }
+          sh ("""#!/busybox/sh
+              echo "******************************* this is on the kaniko container  ********************************"
+              /kaniko/executor --context ${WORKSPACE}/3tier-app/api/ --verbosity debug --destination ${ImageRegistry}/${ImageRepository}/${apiBuilderImageName}:${BUILD_NUMBER}
+          """)
+                        }
+                    }
+                }
+            }
+    stage('Docker build web') {
+                steps{
+                    container(name: 'kaniko', shell: '/busybox/sh'){
+                        dir("${workspace}/3tier-app") {
+        withCredentials([file(credentialsId: 'DockerCredentialConfig', variable: 'dockerConfig')]) {
+            sh ('''#!/busybox/sh
+                cp $dockerConfig /kaniko/.docker/config.json
+            ''')
+          }
+          sh ("""#!/busybox/sh
+              echo "******************************* this is on the kaniko container  ********************************"
+              /kaniko/executor --context ${WORKSPACE}/3tier-app/web/ --verbosity debug --destination ${ImageRegistry}/${ImageRepository}/${webBuilderImageName}:${BUILD_NUMBER}
+          """)
+                        }
+                    }
+                }
+            }
+
+      stage('Test API Image') {
+        agent {
+          kubernetes {
+            yaml """
+        kind: Pod
+        metadata:
+          labels:
+            image-name: ${apiBuilderImageName}
+            image-tag: ${BUILD_NUMBER}
+            jenkins: slave
+          namespace: jenkins
+        spec:
+          containers:
+          - name: jnlp
+            image: jenkins/jnlp-slave
+          - name: ${apiBuilderImageName}
+            image: ${ImageRegistry}/${ImageRepository}/${apiBuilderImageName}:${BUILD_NUMBER}
+            imagePullPolicy: Always
+            command:
+            - cat
+            tty: true
+          - name: postgres
+            image: postgres:12
+            imagePullPolicy: "IfNotPresent"
+            ports:
+              - containerPort: 5432            
+            env:
+              - name: POSTGRES_DB
+                value: postgresdb
+              - name: POSTGRES_USER
+                value: postgresadmin
+              - name: POSTGRES_PASSWORD
+                value: admin123
+        """
+          }
+        }
+        steps{
+          script {
+              container("${apiBuilderImageName}") {
+                sh ('''
+                    apk add curl
+                    export DBUSER=postgresadmin
+                    export DBPASS=admin123
+                    export DB=postgresdb
+                    export DBHOST=localhost
+                    export DBPORT=5432
+                    export PORT=8082
+                    cd /api
+                    nohup npm start &2>&1
+                    sleep 5s
+                    curl -sI http://localhost:8082/api/status
+                ''')  
+            } 
+          }
+        }
+      }
+
+      stage('Test Web Image') {
+        agent {
+          kubernetes {
+            yaml """
+        kind: Pod
+        metadata:
+          labels:
+            image-name: ${webBuilderImageName}
+            image-tag: ${BUILD_NUMBER}
+            jenkins: slave
+          namespace: jenkins
+        spec:
+          containers:
+          - name: jnlp
+            image: jenkins/jnlp-slave
+          - name: ${webBuilderImageName}
+            image: ${ImageRegistry}/${ImageRepository}/${webBuilderImageName}:${BUILD_NUMBER}
+            imagePullPolicy: Always
+            command:
+            - cat
+            tty: true
+        """
+          }
+        }
+        steps{
+          script {
+              container("${webBuilderImageName}") {
+                sh ('''
+                apk add curl
+                export API_HOST=http://localhost:8082
+                export PORT=8083
+                cd /web
+                nohup npm start &2>&1
+                sleep 5s
+                curl -sI http://localhost:8083
+                ''')  
+            } 
+          }
+        }
+      }
+
+          }// end of stages
+  }// end of pipeline
+
+def checkoutSCM(String repoUrl, String repoBranch, String repoCreds, String repoDir, String polling) {
+  retry(10) {
+        dir("${repoDir}") {
+      checkout changelog: Boolean.valueOf("${polling}"), poll: Boolean.valueOf("${polling}"), scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${repoBranch}"]],
+                                                          doGenerateSubmoduleConfigurations: false,
+                                                          extensions: [[$class: 'CloneOption', depth: 2, noTags: true, reference: '', shallow: true, timeout: 30],
+                                                                       [$class: 'LocalBranch', localBranch: "${repoBranch}"]],
+                                                                        submoduleCfg: [],
+                                                          userRemoteConfigs: [[credentialsId: "${repoCreds}", url: "${repoUrl}"]]]
+        }
+  }
+}

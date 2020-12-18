@@ -1,0 +1,182 @@
+#!/usr/bin/env groovy
+
+git_creds = 'toptal-gitlab-creds'
+ImageRegistry = 'docker.io'
+ImageRepository = 'manjumaikan'
+apiBuilderImageName = '3tier-api'
+webBuilderImageName = '3tier-web'
+AWS_DEFAULT_REGION = 'ap-southeast-2'
+
+pipeline {
+    agent {
+        kubernetes {
+            workingDir '/tmp/jenkins'
+            yaml """
+              kind: Pod
+              metadata:
+                namespace: jenkins
+                labels:
+                  jenkins: slave
+              spec:
+                containers:
+                - name: jnlp
+                  image: jenkins/jnlp-slave
+                - name: aws-cli
+                  image: jshimko/kube-tools-aws:latest
+                  tty: true
+                  env:
+                    - name: AWS_DEFAULT_REGION
+                      value: ${AWS_DEFAULT_REGION}
+                """
+              }
+          }
+        parameters {
+        string(name:'ENVIRONMENT' ,defaultValue: 'dev', description: 'deployment Environment')  
+        password(name:'DBPassword' , defaultValue: 'change_m3_aft3r_build', description: 'Enter a password')
+		    string(name:'Weight' ,defaultValue: '0', description: 'Weight of Traffic for api and web servers')  
+        extendedChoice(
+            name: 'docker_build_version', 
+            defaultValue: '', 
+            description: 'select docker build version to deploy', 
+            type: 'PT_SINGLE_SELECT', 
+            groovyScript: 
+            """
+            import jenkins.*
+            import jenkins.model.*
+            import hudson.*
+            import hudson.model.*
+
+            builds = []
+            for(String jobname : Hudson.instance.getAllItems()*.fullName.findAll { it =~ /(?i)3-tier.build/ } ) {
+            job = Jenkins.getInstance().getItemByFullName(jobname)
+            builds += job.getBuilds().overThresholdOnly(Result.SUCCESS).limit(12).collect { it.displayName.replaceAll("3tier:","") }
+            }
+            return builds.sort().reverse()
+            """
+            )
+    }
+    environment {
+        //timestamp = new Date().format('yyyyMMddhhmmss')
+        workspace = pwd()
+        AWS_ACCESS_KEY_ID = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+        AWS_SESSION_TOKEN = credentials('AWS_SESSION_TOKEN')
+        AWS_ASSUME_ROLE = credentials('AWS_ASSUME_ROLE')
+        HOSTED_ZONE = credentials('HOSTED_ZONE')
+        ENVIRONMENT = "${ENVIRONMENT.toLowerCase()}"
+        BUILD_TO_DEPLOY = "${docker_build_version}"
+        DOCKER = credentials('DOCKER')
+		    Weight = "${Weight}"
+    }
+
+    options {
+        disableConcurrentBuilds()
+        //buildDiscarder(logRotator(numToKeepStr: '1'))
+    }
+
+    stages {
+/*
+ * STAGE: Checkout Source code from git
+ */
+
+ 
+        stage('Checkout infra') {
+                steps {
+                  checkoutSCM('https://git.toptal.com/screening/manju-maikan-krishnappa', 'master', "${git_creds}", '3tier-infra', 'false')
+                  script {
+                    currentBuild.displayName = "3tier-deploy:${ENVIRONMENT}:${BUILD_TO_DEPLOY}-weight:${Weight}"
+                    currentBuild.description = "Deploying components of 3 tier app"
+                    }
+                  }
+                }
+
+        stage('Setup AWS Login') {
+                steps{        
+                    container(name: 'aws-cli'){
+                        dir("${workspace}/3tier-infra") {
+                            sh ('''
+                            set +x
+                            export AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+                            export AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+                            export AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+                            apk add jq
+                            aws --version
+                            aws sts get-caller-identity
+                            ''')
+                        }
+                      }
+                    }
+                  }
+
+ 
+        stage("Deploy App") {
+            steps {
+                container(name: 'aws-cli'){
+                    dir("${workspace}/3tier-infra/aws/cfn/") {
+                      sh ('''
+                            set +x
+                            CREDENTIALS=$(aws sts assume-role --role-arn ${AWS_ASSUME_ROLE} --role-session-name \"dev-iam-role\" | jq -r .Credentials)
+                            export AWS_ACCESS_KEY_ID=$(echo ${CREDENTIALS}|jq -r .AccessKeyId)
+                            export AWS_SECRET_ACCESS_KEY=$(echo ${CREDENTIALS}|jq -r .SecretAccessKey)
+                            export AWS_SESSION_TOKEN=$(echo ${CREDENTIALS}|jq -r .SessionToken)
+                            export DBPassword=$DBPassword
+                            export dockerUser=$DOCKER_USR
+                            export dockerPass=$DOCKER_PSW
+                            export BUILD_TO_DEPLOY=$BUILD_TO_DEPLOY
+                            aws cloudformation deploy --template-file 3-tier-db.yaml --stack-name aws-3-tier-db-${ENVIRONMENT} --parameter-overrides \$(cat ../env/\${ENVIRONMENT}.ini) DBPassword=${DBPassword} --no-fail-on-empty-changeset
+                            AMI_ID=`aws ec2 describe-images --region ap-southeast-2 --filters 'Name=is-public,Values=false' 'Name=name,Values=amzn*' --query 'reverse(sort_by(Images, &CreationDate))[0].ImageId' --output text`
+                            aws cloudformation deploy --template-file 3-tier-api.yaml --stack-name aws-3-tier-api-${ENVIRONMENT}-${BUILD_TO_DEPLOY} --region ap-southeast-2 --parameter-overrides \$(cat ../env/\${ENVIRONMENT}.ini) AMIID=${AMI_ID}  dockerUser=${dockerUser} dockerPass=${dockerPass} Image=${BUILD_TO_DEPLOY} EnvSubCode=${ENVIRONMENT} DatabaseStack=aws-3-tier-db-${ENVIRONMENT} MonitoringDNS=aws-3tier-monit-${ENVIRONMENT}.${HOSTED_ZONE} HostedZone=${HOSTED_ZONE}. InstanceProfile=dev-learningsandpit-instanceprofile Weight=${Weight} --no-fail-on-empty-changeset
+                            aws cloudformation deploy --template-file 3-tier-web.yaml --stack-name aws-3-tier-web-${ENVIRONMENT}-${BUILD_TO_DEPLOY} --region ap-southeast-2 --parameter-overrides \$(cat ../env/\${ENVIRONMENT}.ini) AMIID=${AMI_ID}  dockerUser=${dockerUser} dockerPass=${dockerPass} Image=${BUILD_TO_DEPLOY} EnvSubCode=${ENVIRONMENT} ApiStack=aws-3-tier-api-${ENVIRONMENT}-${BUILD_TO_DEPLOY} MonitoringDNS=aws-3tier-monit-${ENVIRONMENT}.${HOSTED_ZONE} HostedZone=${HOSTED_ZONE}. InstanceProfile=dev-learningsandpit-instanceprofile Weight=${Weight} --no-fail-on-empty-changeset
+                            
+                          ''')
+                      script {
+                        try {
+                          sh ('''
+                            dbSecGrpid=`aws ec2 describe-security-groups --filters Name=group-name,Values=aws-3tier-db-sg-${ENVIRONMENT} --query "SecurityGroups[*].[GroupId]" --output text`
+                            apiSecGrpId=`aws ec2 describe-security-groups --filters Name=group-name,Values=aws-3tier-api-sg-${ENVIRONMENT}-${BUILD_TO_DEPLOY} --query "SecurityGroups[*].[GroupId]" --output text`
+                            aws ec2 authorize-security-group-ingress --group-id ${dbSecGrpid} --protocol tcp --port 5432 --source-group ${apiSecGrpId}
+                            ''')
+                            } catch (err) {
+                                echo err.getMessage()
+                              }
+                            }   
+                    }
+                  }
+                }
+              }
+
+        stage("Deploy Monitoring") {
+            steps {
+                container(name: 'aws-cli'){
+                    dir("${workspace}/3tier-infra/aws/cfn/") {
+                      sh ('''
+                            set +x
+                            CREDENTIALS=$(aws sts assume-role --role-arn ${AWS_ASSUME_ROLE} --role-session-name \"dev-iam-role\" | jq -r .Credentials)
+                            export AWS_ACCESS_KEY_ID=$(echo ${CREDENTIALS}|jq -r .AccessKeyId)
+                            export AWS_SECRET_ACCESS_KEY=$(echo ${CREDENTIALS}|jq -r .SecretAccessKey)
+                            export AWS_SESSION_TOKEN=$(echo ${CREDENTIALS}|jq -r .SessionToken)
+                            export dockerUser=$DOCKER_USR
+                            export dockerPass=$DOCKER_PSW
+                            export BUILD_TO_DEPLOY=$BUILD_TO_DEPLOY
+                            AMI_ID=`aws ec2 describe-images --region ap-southeast-2 --filters 'Name=is-public,Values=false' 'Name=name,Values=amzn*' --query 'reverse(sort_by(Images, &CreationDate))[0].ImageId' --output text`
+                            aws cloudformation deploy --template-file 3-tier-monitoring.yaml --stack-name aws-3-tier-monit-${ENVIRONMENT} --parameter-overrides \$(cat ../env/\${ENVIRONMENT}.ini) AMIID=${AMI_ID}  dockerUser=${dockerUser} dockerPass=${dockerPass} EnvSubCode=${ENVIRONMENT} ApiStack=aws-3-tier-api-${ENVIRONMENT}-${BUILD_TO_DEPLOY} WebStack=aws-3-tier-web-${ENVIRONMENT}-${BUILD_TO_DEPLOY} HostedZone=${HOSTED_ZONE}. InstanceProfile=dev-learningsandpit-instanceprofile --no-fail-on-empty-changeset
+                          ''')
+                    }
+                  }
+                }
+              }              
+            }
+}
+return this;
+def checkoutSCM(String repoUrl, String repoBranch, String repoCreds, String repoDir, String polling) {
+  retry(10) {
+        dir("${repoDir}") {
+      checkout changelog: Boolean.valueOf("${polling}"), poll: Boolean.valueOf("${polling}"), scm: [$class: 'GitSCM', branches: [[name: "refs/heads/${repoBranch}"]],
+                                                          doGenerateSubmoduleConfigurations: false,
+                                                          extensions: [[$class: 'CloneOption', depth: 2, noTags: true, reference: '', shallow: true, timeout: 30],
+                                                                       [$class: 'LocalBranch', localBranch: "${repoBranch}"]],
+                                                                        submoduleCfg: [],
+                                                          userRemoteConfigs: [[credentialsId: "${repoCreds}", url: "${repoUrl}"]]]
+        }
+  }
+}

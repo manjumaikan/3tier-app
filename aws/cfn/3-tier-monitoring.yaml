@@ -1,0 +1,283 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Monitoring stack for the 3 tier application
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'EC2 Parameters'
+        Parameters:
+          - EnvSubCode
+      - Label:
+          default: 'Cluster Parameters'
+        Parameters:
+          - InstanceType
+          - InstanceProfile
+      - Label:
+          default: 'Api Parameters'
+        Parameters:
+          - ApiStack
+          - WebStack
+      - Label:
+          default: 'DNS Parameters'
+        Parameters:
+          - HostedZone          
+
+Parameters:
+  EnvSubCode:
+    Description: Which logical environment ?
+    Type: String
+    AllowedValues:
+      - ci
+      - dev
+      - st
+      - psup
+      - prod
+  InstanceType:
+    Description: 'The instance type of the EC2 instance.'
+    Type: String
+    Default: 't3.large'
+  InstanceProfile:
+    Description: 'The instance profile of the EC2 instance.'
+    Type: String
+  AMIID:
+    Description: 'AMI ID to be used for the EC2 instance'
+    Type: AWS::EC2::Image::Id
+  dockerPass:
+    Description: Docker password
+    Type: String
+    NoEcho: true
+  dockerUser:
+    Description: Docker password
+    Type: String
+    NoEcho: true
+  ApiStack:
+    Description: 'stack name of the Api stack.'
+    Type: String
+    Default: 'aws-3-tier-api-${EnvSubCode}'
+  WebStack:
+    Description: 'stack name of the Web stack.'
+    Type: String
+    Default: 'aws-3-tier-web-${EnvSubCode}'    
+  HostedZone:    
+    Description: 'Hosted Zone for the monitoring stack.'
+    Type: String
+
+Resources:
+
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub aws-3tier-monit-sg-${EnvSubCode}
+      GroupDescription: 'aws 3 tier monit SG'
+      VpcId: !ImportValue 'vpc:vpc1'
+
+  SecurityGroupSelf:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  SecurityGroupInSSH:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: '0.0.0.0/0'
+
+  SecurityGroupInElastic:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 9200
+      ToPort: 9200
+      CidrIp: '0.0.0.0/0'
+
+  SecurityGroupInLogstash:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 5044
+      ToPort: 5044
+      CidrIp: '0.0.0.0/0'
+
+  SecurityGroupInKibana:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 5601
+      ToPort: 5601
+      CidrIp: '0.0.0.0/0'
+
+  SecurityGroupInPrometheus:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 9090
+      ToPort: 9090
+      CidrIp: '0.0.0.0/0'
+  
+  SecurityGroupInGrafana:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 3000
+      ToPort: 3000
+      CidrIp: '0.0.0.0/0'
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          default: [install]
+        install:
+          files:
+            '/etc/init.d/startPrometheus':
+              content: !Sub |
+                #!/bin/bash
+                # chkconfig: 2345 20 80
+                # description: Shell script to restart prometheus during startup
+                # Source function library.
+
+                . /etc/init.d/functions
+
+                start() {
+                echo "1"
+                nohup "/prometheus-1.0.1.linux-amd64/prometheus" --config.file="/etc/prometheus/prometheus.yml" >> "/prometheus-1.0.1.linux-amd64/prometheus.log" &2>&1
+                }
+
+                stop() {
+                echo "2"
+                }
+
+                case "$1" in
+                start)
+                start
+                ;;
+
+                stop)
+                stop
+                ;;
+
+                restart)
+                stop
+                start
+                ;;
+
+                status)
+                # code to check status of app comes here
+                # example: status program_name
+                ;;
+                *)
+                echo "Usage: $0 {start|stop|status|restart}"
+                esac
+                exit 0
+
+              mode: '000755'
+              owner: root
+              group: root
+
+    Properties:
+      ImageId: !Ref AMIID
+      KeyName: aws-3tier-key
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !ImportValue 'subnet:vpc1:application:a'
+      UserData:
+        Fn::Base64: 
+            Fn::Sub:
+              - |
+                #!/bin/bash -ex
+                amazon-linux-extras install docker
+                yum install -y wget
+                yum install -y awscli
+                service docker start
+                usermod -a -G docker ec2-user
+                chkconfig docker on
+                yum install -y aws-cfn-bootstrap
+                /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+                chkconfig --add /etc/init.d/startPrometheus && chkconfig --level 2345 startPrometheus on
+                ln -s /usr/local/lib/python2.7/site-packages/cfnbootstrap /usr/lib/python2.7/site-packages/cfnbootstrap
+                sysctl -w vm.max_map_count=262144
+                echo "vm.max_map_count = 262144" >> /etc/sysctl.conf
+                docker login https://index.docker.io/v1/ -u ${dockerUser} -p ${dockerPass}
+                docker pull sebp/elk
+                export apihost=${apihost}  
+                export webhost=${webhost}    
+                echo "aws-3tier-api $apihost" >> /etc/hosts
+                echo "aws-3tier-web $webhost" >> /etc/hosts                                    
+                docker run --name 3tier-elk-stack \
+                  --ulimit nofile=65535:65535 \
+                  --privileged \
+                  --restart=always \
+                  --detach=true \
+                  --publish=5601:5601 \
+                  --publish=9200:9200 \
+                  --publish=5044:5044 \
+                  sebp/elk
+                docker run --name grafana \
+                  --privileged \
+                  --restart=always \
+                  --detach=true \
+                  --publish=3000:3000 \
+                  grafana/grafana
+                wget https://github.com/prometheus/prometheus/releases/download/v1.0.1/prometheus-1.0.1.linux-amd64.tar.gz  
+                tar xvfz prometheus-*.*-amd64.tar.gz            
+                mkdir -p /etc/prometheus/ && cat << EOF >> /etc/prometheus/prometheus.yml
+                global:
+                  scrape_interval: 15s
+                scrape_configs:
+                - job_name: 'nodes-dev'
+                  ec2_sd_configs:
+                  - region: ap-southeast-2
+                    port: 9100
+                    refresh_interval: 1m
+                  relabel_configs:
+                  - source_labels: [__meta_ec2_tag_Name]
+                    regex: aws-3tier-.*.-${EnvSubCode}
+                    target_label: 'instance'
+                EOF
+                cd prometheus-1.0.1.linux-amd64 && nohup ./prometheus --config.file=/etc/prometheus/prometheus.yml >> prometheus.log &2>&1      
+              - apihost: 
+                  Fn::ImportValue: 
+                    !Sub '${ApiStack}-DNSName'
+                webhost: 
+                  Fn::ImportValue: 
+                    !Sub '${WebStack}-DNSName'                    
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-',['aws-3tier-monit',!Ref EnvSubCode]]                    
+
+  dns4monitoring:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref HostedZone
+      RecordSets:
+      - Name: !Join ['', ['aws-3tier-monit', '-', !Ref 'EnvSubCode','.', !Ref HostedZone]]
+        Type: A
+        TTL: '900'
+        ResourceRecords:
+        - !GetAtt EC2Instance.PrivateIp
+
+Outputs:
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  DNSName:
+    Description: 'The DNS name for the monitoring server.'
+    Value: !Join ['', ['aws-3tier-monit', '-', !Ref 'EnvSubCode','.', !Ref HostedZone]]
+    Export:
+      Name: !Sub '${AWS::StackName}-DNSName'    

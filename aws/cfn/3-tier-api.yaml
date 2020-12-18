@@ -1,0 +1,523 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: API layer for the 3 tier application
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+      - Label:
+          default: 'EC2 Parameters'
+        Parameters:
+          - EnvSubCode
+      - Label:
+          default: 'Load Balancer Parameters'
+        Parameters:
+          - LoadBalancerScheme
+          - LoadBalancerCertificateArn
+          - LoadBalancerIdleTimeout
+      - Label:
+          default: 'Cluster Parameters'
+        Parameters:
+          - InstanceType
+          - InstanceProfile
+          - MaxSize
+          - MinSize
+          - DesiredCapacity
+      - Label:
+          default: 'Api Parameters'
+        Parameters:
+          - DatabaseStack
+          - MonitoringDNS
+          - HostedZone    
+          - Weight
+
+Parameters:
+  EnvSubCode:
+    Description: Which logical environment ?
+    Type: String
+    AllowedValues:
+      - ci
+      - dev
+      - st
+      - psup
+      - prod
+  LoadBalancerScheme:
+    Description: 'Indicates whether the load balancer in front of the ASG is internet-facing or internal.'
+    Type: String
+    Default: 'internal'
+    AllowedValues:
+      - 'internet-facing'
+      - 'internal'
+  LoadBalancerCertificateArn:
+    Description: 'Optional Amazon Resource Name (ARN) of the certificate to associate with the load balancer.'
+    Type: String
+    Default: ''
+  LoadBalancerIdleTimeout:
+    Description: 'The idle timeout value, in seconds.'
+    Type: Number
+    Default: 60
+    MinValue: 1
+    MaxValue: 4000
+  InstanceType:
+    Description: 'The instance type of the EC2 instances of the ASG.'
+    Type: String
+    Default: 't2.micro'
+  InstanceProfile:
+    Description: 'The instance profile of the EC2 instance.'
+    Type: String
+  MaxSize:
+    Description: 'The maximum size of the Auto Scaling group.'
+    Type: Number
+    Default: 4
+    ConstraintDescription: 'Must be >= 1'
+    MinValue: 1
+  MinSize:
+    Description: 'The minimum size of the Auto Scaling group.'
+    Type: Number
+    Default: 2
+    ConstraintDescription: 'Must be >= 1'
+    MinValue: 1
+  DesiredCapacity:
+    Description: 'The Desired size of the Auto Scaling group. For the scheduler to keep note of desired capacity'
+    Type: Number
+    Default: 2
+    ConstraintDescription: 'Must be >= 1'
+    MinValue: 1
+  AMIID:
+    Description: 'AMI ID to be used for the ASG'
+    Type: AWS::EC2::Image::Id
+  Image:
+    Description: 'Docker image name'
+    Type: String
+  dockerPass:
+    Description: Docker password
+    Type: String
+    NoEcho: true
+  dockerUser:
+    Description: Docker password
+    Type: String
+    NoEcho: true
+  DatabaseStack:
+    Description: 'stack name of the database stack.'
+    Type: String
+    Default: 'aws-3-tier-db-${EnvSubCode}'
+  MonitoringDNS:
+    Description: 'Monitoring instance DNS'
+    Type: String
+    Default: 'aws-3-tier-monit-${EnvSubCode}-${HostedZone}'    
+  HostedZone:    
+    Description: 'Hosted Zone for the Web stack.'
+    Type: String    
+  Weight:
+    Description: 'Weight of traffic to be routed'
+    Type: Number
+
+Mappings:
+  ENVIRONS:
+    NonProduction:
+      ABRV: np
+    Production:
+      ABRV: pr
+    End2End:
+      ABRV: ee
+    ProductionSupport:
+      ABRV: ps
+
+Conditions:
+  HasLoadBalancerCertificateArn: !Not [!Equals [!Ref LoadBalancerCertificateArn, '']]
+
+Resources:
+
+  ALBSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub aws-3tier-api-${EnvSubCode}-${Image}
+      GroupDescription: 'ALB SG'
+      VpcId: !ImportValue 'vpc:vpc1'
+
+  ALBSecurityGroupInHttp:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8082
+      ToPort: 8082
+      CidrIp: '0.0.0.0/0'
+
+  ALBSecurityGroupInHttps:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: '0.0.0.0/0'
+
+  ALBSecurityGroupSelf:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupName: !Sub aws-3tier-api-sg-${EnvSubCode}-${Image}
+      GroupDescription: 'aws 3 tier api SG'
+      VpcId: !ImportValue 'vpc:vpc1'
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref ALBSecurityGroup
+          FromPort: 0
+          ToPort: 65535
+          IpProtocol: tcp
+
+  SecurityGroupSelf:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 0
+      ToPort: 65535
+      SourceSecurityGroupId: !Ref SecurityGroup
+
+  SecurityGroupInSSH:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: '0.0.0.0/0'
+
+  SecurityGroupInNodeExporter:
+    Type: 'AWS::EC2::SecurityGroupIngress'
+    Properties:
+      GroupId: !Ref SecurityGroup
+      IpProtocol: tcp
+      FromPort: 9100
+      ToPort: 9100
+      CidrIp: '0.0.0.0/0'
+ 
+  LoadBalancer:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      LoadBalancerAttributes:
+        - Key: 'idle_timeout.timeout_seconds'
+          Value: !Ref LoadBalancerIdleTimeout
+        - Key: 'routing.http2.enabled'
+          Value: 'true'
+        - Key: 'access_logs.s3.enabled'
+          Value: 'false'
+      Scheme: !Ref LoadBalancerScheme
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - {'Fn::ImportValue': 'subnet:vpc1:application:a'}
+        - {'Fn::ImportValue': 'subnet:vpc1:application:b'}
+        - {'Fn::ImportValue': 'subnet:vpc1:application:c'}
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-',['aws-3tier-api',!Ref EnvSubCode,!Ref Image]]
+  dns4Api:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      HostedZoneName: !Ref HostedZone
+      RecordSets:
+      - Name: !Join ['', ['aws-3tier-api', '-', !Ref 'EnvSubCode','.', !Ref HostedZone]]
+        Type: A
+        AliasTarget:
+          DNSName: !GetAtt 'LoadBalancer.DNSName'
+          HostedZoneId: !GetAtt 'LoadBalancer.CanonicalHostedZoneID'
+        Weight: !Ref Weight
+        SetIdentifier: !Join ['-',['aws-3tier-api',!Ref EnvSubCode,!Ref Image]]        
+
+  DefaultTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Name: !Join ['-',['aws-3tier-api-tg',!Ref EnvSubCode,!Ref Image]]
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPort: '8082'
+      HealthCheckPath: '/'
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200-499'
+      Port: 8082
+      Protocol: HTTP
+      VpcId: !ImportValue 'vpc:vpc1'
+      TargetGroupAttributes:
+        - Key: 'deregistration_delay.timeout_seconds'
+          Value: '0'
+
+  HttpListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref DefaultTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8082
+      Protocol: HTTP
+
+  HttpsListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Condition: HasLoadBalancerCertificateArn
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref LoadBalancerCertificateArn
+      DefaultActions:
+        - TargetGroupArn: !Ref DefaultTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+
+  LaunchConfiguration:
+    Type: 'AWS::AutoScaling::LaunchConfiguration'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          default: [install]
+        install:
+          files:
+            '/etc/cfn/cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.LaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init --verbose --stack=${AWS::StackName} --region=${AWS::Region} --resource=LaunchConfiguration
+                runas=root
+            '/etc/init.d/startNodeExporter':
+              content: !Sub |
+                #!/bin/bash
+                # chkconfig: 2345 20 80
+                # description: Shell script to restart node exporter during startup
+                # Source function library.
+
+                . /etc/init.d/functions
+
+                start() {
+                echo "1"
+                nohup "/node_exporter-1.0.1.linux-amd64/node_exporter" >> "/node_exporter-1.0.1.linux-amd64/node_exporter.log" &2>&1
+                }
+
+                stop() {
+                echo "2"
+                }
+
+                case "$1" in
+                start)
+                start
+                ;;
+
+                stop)
+                stop
+                ;;
+
+                restart)
+                stop
+                start
+                ;;
+
+                status)
+                # code to check status of app comes here
+                # example: status program_name
+                ;;
+                *)
+                echo "Usage: $0 {start|stop|status|restart}"
+                esac
+                exit 0
+
+              mode: '000755'
+              owner: root
+              group: root                                
+
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - '/etc/cfn/cfn-hup.conf'
+                  - '/etc/cfn/hooks.d/cfn-auto-reloader.conf'
+    Properties:
+      LaunchConfigurationName: !Join ['-',['aws-3tier-api-lc',!Ref EnvSubCode,!Ref Image]]
+      ImageId: !Ref AMIID
+      KeyName: aws-3tier-key
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SecurityGroups:
+        - !Ref SecurityGroup
+      UserData:
+        Fn::Base64: 
+            Fn::Sub:
+              - |
+                #!/bin/bash -ex
+                trap '/opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}' ERR  # Use this line if you want to let CFN know of the failure.
+                amazon-linux-extras install docker
+                chkconfig --add /etc/init.d/startNodeExporter && chkconfig --level 2345 startNodeExporter on
+                yum install -y wget
+                yum install -y awscli
+                service docker start
+                usermod -a -G docker ec2-user
+                chkconfig docker on
+                yum install -y aws-cfn-bootstrap
+                ln -s /usr/local/lib/python2.7/site-packages/cfnbootstrap /usr/lib/python2.7/site-packages/cfnbootstrap
+                docker login https://index.docker.io/v1/ -u ${dockerUser} -p ${dockerPass}
+                mkdir -p /etc/elastic/ && cat << EOF >> /etc/elastic/fluent.conf
+                 <source>
+                    @type forward
+                    port 24224
+                    bind "0.0.0.0"
+                  </source>
+                  <match *.**>
+                      @type "elasticsearch"
+                      host "${MonitoringDNS}"
+                      port 9200
+                      logstash_format true
+                      logstash_prefix "fluentd"
+                      logstash_dateformat "%Y%m%d"
+                      include_tag_key true
+                      type_name "docker_log"
+                      tag_key "@log_name"
+                      flush_interval 1s
+                  </match>
+                EOF
+                docker run --rm \
+                -v /etc/elastic/fluent.conf:/fluentd/etc/fluent.conf -dit \
+                -p 24224:24224 \
+                --name fluent-elastic \
+                govtechsg/fluentd-elasticsearch:latest
+                docker pull manjumaikan/3tier-api:${Image}
+                export dbname=${dbname}
+                export dbhost=${dbhost}
+                export dbport=${dbport}
+                export dbuser=${dbuser}
+                export dbpass=${dbpass}
+                docker run --name 3tier-api \
+                  --privileged \
+                  --restart=on-failure:10 \
+                  --detach=true \
+                  --publish=8082:8082 \
+                  --env=DB=${dbname} \
+                  --env=DBHOST=${dbhost} \
+                  --env=DBPORT=${dbport} \
+                  --env=DBUSER=${dbuser} \
+                  --env=DBPASS=${dbpass} \
+                  --env=SSL=true \
+                  --env=PORT=8082 \
+                  --log-driver=fluentd \
+                  --log-opt tag="docker.{{.Name}}" \
+                  "manjumaikan/3tier-api:${Image}" \
+                  npm start
+                wget https://github.com/prometheus/node_exporter/releases/download/v1.0.1/node_exporter-1.0.1.linux-amd64.tar.gz  
+                tar xvfz node_exporter-*.*-amd64.tar.gz         
+                cd node_exporter-1.0.1.linux-amd64 && nohup ./node_exporter >> node_exporter.log &2>&1         
+                /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfiguration --region ${AWS::Region}
+                /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+              - dbname: 
+                  Fn::ImportValue: 
+                    !Sub '${DatabaseStack}-DatabaseName'
+                dbhost: 
+                  Fn::ImportValue: 
+                    !Sub '${DatabaseStack}-DatabaseHostname'
+                dbport:
+                  Fn::ImportValue: 
+                    !Sub '${DatabaseStack}-DatabaseEndpointPort'
+                dbuser:
+                  Fn::ImportValue:
+                    !Sub '${DatabaseStack}-DatabaseUsername'
+                dbpass:
+                  Fn::ImportValue:
+                    !Sub '${DatabaseStack}-DatabasePassword'
+
+  AutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      AutoScalingGroupName: !Join ['-',['aws-3tier-api-asg',!Ref EnvSubCode,!Ref Image]]
+      LaunchConfigurationName: !Ref LaunchConfiguration
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      HealthCheckGracePeriod: 300
+      HealthCheckType: ELB
+      TargetGroupARNs:
+        - !Ref DefaultTargetGroup
+      VPCZoneIdentifier: [{'Fn::ImportValue': 'subnet:vpc1:application:a'}, {'Fn::ImportValue': 'subnet:vpc1:application:b'}, {'Fn::ImportValue': 'subnet:vpc1:application:c'}]
+      Tags:
+        - Key: "Name"
+          Value: !Join ['-',['aws-3tier-api',!Ref EnvSubCode,!Ref Image]]
+          PropagateAtLaunch: true
+        - Key: "state:asg:min"
+          Value: !Ref MinSize
+          PropagateAtLaunch: true
+        - Key: "state:asg:max"
+          Value: !Ref MaxSize
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        PauseTime: PT20M
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+        WaitOnResourceSignals: true
+
+  ScaleUpPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: StepScaling
+      AdjustmentType: PercentChangeInCapacity
+      MinAdjustmentMagnitude: 1
+      StepAdjustments:
+        - MetricIntervalUpperBound: 0.0
+          ScalingAdjustment: 25
+  ScaleDownPolicy:
+    Type: 'AWS::AutoScaling::ScalingPolicy'
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: StepScaling
+      AdjustmentType: PercentChangeInCapacity
+      MinAdjustmentMagnitude: 1
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0.0
+          ScalingAdjustment: -25
+
+Outputs:
+  TemplateID:
+    Description: 'ASG Cluster.'
+    Value: 'ec2/asg'
+  TemplateVersion:
+    Description: 'Template Version.'
+    Value: '__VERSION__'
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  LoadBalancerFullName:
+    Description: 'ALB full name for 3 tier api.'
+    Value: !GetAtt 'LoadBalancer.LoadBalancerFullName'
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerFullName'
+  DNSName:
+    Description: 'The DNS name for the load balancer.'
+    Value: !GetAtt 'LoadBalancer.DNSName'
+    Export:
+      Name: !Sub '${AWS::StackName}-DNSName'
