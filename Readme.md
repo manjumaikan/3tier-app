@@ -45,7 +45,3 @@ System monitoring is enabled for all the nodes on Prometheus. Node exporters are
 3. Monitoring and logging across all stacks.
 4. High availablilty stacks.
 5. Multi environment deployment capability.
-
-
-
-
